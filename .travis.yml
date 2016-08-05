@@ -15,4 +15,3 @@ deploy:
   on:
     tags: true
     repo: timmartin19/thread_queue
-    condition: "$TOXENV == py27"
