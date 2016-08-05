@@ -12,7 +12,7 @@ except ImportError:
 
 __author__ = 'Tim Martin'
 __email__ = 'tim@timmartin.me'
-__version__ = '0.2.1'
+__version__ = '0.2.2'
 
 LOG = logging.getLogger(__name__)
 
