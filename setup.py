@@ -20,7 +20,7 @@ test_requirements = [
 
 setup(
     name='thread-queue',
-    version='0.2.0',
+    version='0.2.1',
     description="A tool to queue tasks and execute them on a fixed number of threads",
     long_description=readme + '\n\n' + history,
     author="Tim Martin",
