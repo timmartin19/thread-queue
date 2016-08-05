@@ -6,15 +6,51 @@ from __future__ import unicode_literals
 import logging
 from threading import Thread
 try:
-    from queue import Queue
+    from queue import Queue, Empty
 except ImportError:
-    from Queue import Queue
+    from Queue import Queue, Empty
 
 __author__ = 'Tim Martin'
 __email__ = 'tim@timmartin.me'
 __version__ = '0.1.0'
 
 LOG = logging.getLogger(__name__)
+
+t = Thread()
+
+
+class QueueNotEmptyException(Exception):
+    """
+    Raised when items from the queue have not
+    been processed, likely due to an error in
+    the underlying threads
+    """
+    def __init__(self, message, items, exceptions):
+        self._unattempted_tasks = items
+        self.thread_exceptions = exceptions
+        super(QueueNotEmptyException, self).__init__(message)
+
+    @property
+    def all_unprocessed_tasks(self):
+        tasks = list(self.unattempted_tasks)
+        thread_task_excs = [exc.task for exc in self.thread_exceptions
+                            if isinstance(exc, ThreadTaskException) and exc.task is not None]
+        return tasks + thread_task_excs
+
+    @property
+    def unattempted_tasks(self):
+        return [task for task in self._unattempted_tasks if task is not None]
+
+
+class ThreadTaskException(Exception):
+    """
+    Wrapper for exceptions that occur within the
+    underlying threads
+    """
+    def __init__(self, message, exc, task=None):
+        self.__cause__ = exc
+        self.task = task
+        super(ThreadTaskException, self).__init__(message)
 
 
 class ThreadQueue(object):
@@ -48,7 +84,8 @@ class ThreadQueue(object):
                  initialization_args=None,
                  initialization_kwargs=None,
                  cleanup_thread=None,
-                 queue=None):
+                 queue=None,
+                 response_queue=None):
         """
         :param function worker: The function to call from the
             generated threads.  This will take the same arguments
@@ -78,7 +115,9 @@ class ThreadQueue(object):
             methods.
         """
         self.thread_count = thread_count
-        self.queue = queue or Queue()
+        self._queue = queue or Queue()
+        self.response_queue = queue or Queue()
+        self._exc_queue = None
         self.initialize_thread = initialize_thread
         self.worker = worker
         self.initialization_args = initialization_args or []
@@ -98,10 +137,12 @@ class ThreadQueue(object):
         Initializes the threads that the queue will be using
         """
         LOG.debug('Starting ThreadQueue threads')
+        self._exc_queue = Queue()
         for i in range(self.thread_count):
-            worker_args = [self.queue, self.initialize_thread,
+            worker_args = [self._queue, self.initialize_thread,
                            self.worker, self.initialization_args,
-                           self.initialization_kwargs, self.cleanup_thread]
+                           self.initialization_kwargs, self.cleanup_thread,
+                           self._exc_queue, self.response_queue]
             thread = Thread(target=_do_work, args=worker_args)
             thread.start()
             self._threads.append(thread)
@@ -117,50 +158,81 @@ class ThreadQueue(object):
         :param tuple args:
         :param dict kwargs:
         """
-        self.queue.put(tuple([args, kwargs]))
+        self._queue.put(tuple([args, kwargs]))
 
     def close(self):
         """
         Waits for the queue to empty and then
         joins the threads
         """
-        self.queue.join()
         for i in range(self.thread_count):
-            self.queue.put(None)
+            self._queue.put(None)
         for thread in self._threads:
             thread.join()
+
+        unfinished_tasks = empty_queue(self._queue)
+        thread_errors = empty_queue(self._exc_queue)
+        if unfinished_tasks or thread_errors:
+            raise QueueNotEmptyException('The ThreadQueue did not finish all tasks',
+                                         unfinished_tasks, thread_errors)
+
         LOG.debug('Closed all ThreadQueue threads')
 
 
-def _do_work(q, initialize_thread, worker, args, kwargs, cleanup_thread):
-    extra = None
-    if initialize_thread:
-        LOG.debug('Initializing thread')
-        extra = initialize_thread(*args, **kwargs)
-    else:
-        LOG.debug('Skipping thread initialization')
+def empty_queue(queue):
+    """
+
+    :param Queue queue:
+    :return:
+    :rtype: list
+    """
+    all_items = []
+    while True:
+        try:
+            all_items.append(queue.get_nowait())
+        except Empty:
+            return all_items
+
+
+def _do_work(q, initialize_thread, worker, args, kwargs, cleanup_thread, exc_queue, response_queue):
     try:
-        _worker_loop(q, worker, extra=extra, has_extra=initialize_thread is not None)
-    finally:
-        if cleanup_thread is None:
-            return
-        LOG.debug('Cleaning up thread')
+        extra = None
         if initialize_thread:
-            cleanup_thread(extra)
+            LOG.debug('Initializing thread')
+            extra = initialize_thread(*args, **kwargs)
         else:
-            cleanup_thread()
+            LOG.debug('Skipping thread initialization')
+        try:
+            _worker_loop(q, worker, response_queue,
+                         extra=extra, has_extra=initialize_thread is not None)
+        finally:
+            if cleanup_thread is not None:
+                LOG.debug('Cleaning up thread')
+                if initialize_thread:
+                    cleanup_thread(extra)
+                else:
+                    cleanup_thread()
+    except Exception as exc:
+        LOG.warning('Exception in ThreadQueue thread', exc_info=True)
+        exc_queue.put(exc)
+        raise
 
 
-def _worker_loop(queue, worker, extra=None, has_extra=False):
+def _worker_loop(queue, worker, response_queue, extra=None, has_extra=False):
     while True:
         item = queue.get()
-        if item is None:
-            LOG.debug('Found break request from parent.  Finishing work')
-            break
-        LOG.debug('Beginning task')
-        if has_extra:
-            worker(extra, *item[0], **item[1])
-        else:
-            worker(*item[0], **item[1])
-        LOG.debug('Finished task')
-        queue.task_done()
+        try:
+            if item is None:
+                LOG.debug('Found break request from parent.  Finishing work')
+                break
+            LOG.debug('Beginning task')
+            if has_extra:
+                resp = worker(extra, *item[0], **item[1])
+            else:
+                resp = worker(*item[0], **item[1])
+            response_queue.put(resp)
+            LOG.debug('Finished task')
+            queue.task_done()
+        except Exception as exc:
+            raise ThreadTaskException('An exception occurred while processing a task',
+                                      exc, task=item)
